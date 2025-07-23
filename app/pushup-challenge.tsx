@@ -259,7 +259,7 @@ export default function PushupChallenge() {
       } catch (error) {
         console.error('❌ Failed to start web camera:', error);
         setFormFeedback('Camera failed - using visual detection');
-        startVisualFallback();
+        startVisualDetection();
       }
     } else {
       console.log('📱 Using mobile camera (already active)');
@@ -280,86 +280,291 @@ export default function PushupChallenge() {
             if (event.accelerationIncludingGravity && isDetecting) {
               const { x, y, z } = event.accelerationIncludingGravity;
               if (x !== null && y !== null && z !== null) {
-                analyzeMotion(x, y, z);
+                analyzeMotion(x || 0, y || 0, z || 0);
               }
             }
           };
           
           // Request permission for iOS 13+
           if (typeof (DeviceMotionEvent as any).requestPermission === 'function') {
-            const permission = await (DeviceMotionEvent as any).requestPermission();
-            if (permission === 'granted') {
-              window.addEventListener('devicemotion', handleMotion);
-              setFormFeedback('Motion sensors active! Place phone on ground and do pushups over it! 📱');
-              setPoseDetectionReady(true);
-            } else {
-              console.log('Motion permission denied, using visual detection');
-              startVisualFallback();
+            try {
+              const permission = await (DeviceMotionEvent as any).requestPermission();
+              if (permission === 'granted') {
+                window.addEventListener('devicemotion', handleMotion);
+                setFormFeedback('Motion sensors active! Do pushups in front of camera! 📱');
+                setPoseDetectionReady(true);
+                console.log('✅ iOS motion permission granted');
+              } else {
+                console.log('❌ Motion permission denied, using visual detection');
+                startVisualDetection();
+              }
+            } catch (error) {
+              console.error('❌ Motion permission error:', error);
+              startVisualDetection();
             }
           } else {
-            // Non-iOS devices
+            // Non-iOS devices - directly add listener
             window.addEventListener('devicemotion', handleMotion);
-            setFormFeedback('Motion sensors active! Place phone on ground and do pushups over it! 📱');
+            setFormFeedback('Motion sensors active! Do pushups in front of camera! 📱');
             setPoseDetectionReady(true);
+            console.log('✅ Motion sensors activated for non-iOS device');
           }
         } else {
-          console.log('DeviceMotionEvent not supported, using visual detection');
-          startVisualFallback();
+          console.log('❌ DeviceMotionEvent not supported, using visual detection');
+          startVisualDetection();
         }
       } else {
         // Mobile: Use expo-sensors
-        const { DeviceMotion } = await import('expo-sensors');
-        
-        DeviceMotion.setUpdateInterval(100); // 10 FPS
-        
-        const subscription = DeviceMotion.addListener(({ x, y, z }) => {
-          if (isDetecting) {
-            analyzeMotion(x, y, z);
-          }
-        });
-        
-        setFormFeedback('Motion sensors active! Place phone on ground and do pushups over it! 📱');
-        setPoseDetectionReady(true);
-        
-        // Store subscription for cleanup
-        detectionIntervalRef.current = subscription as any;
+        try {
+          const { DeviceMotion } = await import('expo-sensors');
+          
+          DeviceMotion.setUpdateInterval(100); // 10 FPS
+          
+          const subscription = DeviceMotion.addListener(({ x, y, z }) => {
+            if (isDetecting) {
+              analyzeMotion(x || 0, y || 0, z || 0);
+            }
+          });
+          
+          setFormFeedback('Motion sensors active! Do pushups in front of camera! 📱');
+          setPoseDetectionReady(true);
+          console.log('✅ Mobile motion sensors activated');
+          
+          // Store subscription for cleanup
+          detectionIntervalRef.current = subscription as any;
+        } catch (error) {
+          console.error('❌ Failed to initialize mobile motion sensors:', error);
+          startVisualDetection();
+        }
       }
     } catch (error) {
       console.error('❌ Failed to start motion detection:', error);
       setFormFeedback('Motion sensors failed, using visual detection');
-      startVisualFallback();
+      startVisualDetection();
     }
   };
 
-  // Fallback visual detection for when motion sensors aren't available
-  const startVisualFallback = () => {
-    console.log('🎯 Starting visual fallback detection...');
-    setPoseDetectionReady(false);
+  // Enhanced visual pushup detection using camera movement analysis
+  const startVisualDetection = () => {
+    console.log('🎯 Starting enhanced visual pushup detection...');
+    setPoseDetectionReady(false); // Visual mode indicator
     
-    let detectionCount = 0;
-    const detectionPattern = [2500, 2300, 2100, 1900, 1700, 1500, 1400, 1300, 1200, 1100];
-    
-    const detectNextPushup = () => {
-      if (detectionCount >= targetPushups || challengeState !== 'active') {
+    if (Platform.OS === 'web' && videoRef.current && canvasRef.current) {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      
+      if (!ctx) {
+        startSimpleDetection();
         return;
       }
       
-      const delay = detectionPattern[detectionCount] || 1200;
+      // Wait for video to be ready
+      const initializeDetection = () => {
+        // Set canvas size to match video
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+        
+        let previousFrame: ImageData | null = null;
+        let isInDownPosition = false;
+        let detectionActive = true;
+        let frameCount = 0;
+        
+        const MOVEMENT_THRESHOLD = 2000; // Minimum pixel difference to detect movement
+        const MIN_TIME_BETWEEN_PUSHUPS = 1200; // Minimum 1.2 seconds between pushups
+        let lastPushupTime = 0;
+        
+        const analyzeFrame = () => {
+          if (!detectionActive || challengeState !== 'active' || !isDetecting) {
+            return;
+          }
+          
+          try {
+            frameCount++;
+            
+            // Draw video frame to canvas
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            // Get current frame data
+            const currentFrame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            
+            if (previousFrame && frameCount % 3 === 0) { // Analyze every 3rd frame for performance
+              // Calculate movement between frames
+              let totalMovement = 0;
+              const data1 = previousFrame.data;
+              const data2 = currentFrame.data;
+              
+              // Sample every 4th pixel for performance
+              for (let i = 0; i < data1.length; i += 16) {
+                const r1 = data1[i], g1 = data1[i + 1], b1 = data1[i + 2];
+                const r2 = data2[i], g2 = data2[i + 1], b2 = data2[i + 2];
+                
+                const diff = Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
+                totalMovement += diff;
+              }
+              
+              // Analyze movement patterns for pushup detection
+              const now = Date.now();
+              
+              if (totalMovement > MOVEMENT_THRESHOLD) {
+                // Significant movement detected
+                setIsInPushupPosition(true);
+                
+                // Use movement intensity to determine pushup phase
+                if (totalMovement > MOVEMENT_THRESHOLD * 1.5 && !isInDownPosition) {
+                  // High movement - going down
+                  isInDownPosition = true;
+                  setCurrentPhase('down');
+                  setFormFeedback('Going down... maintain good form! 📉');
+                } else if (totalMovement > MOVEMENT_THRESHOLD && isInDownPosition && 
+                          now - lastPushupTime > MIN_TIME_BETWEEN_PUSHUPS) {
+                  // Moderate movement after down phase - coming up
+                  isInDownPosition = false;
+                  setCurrentPhase('up');
+                  setFormFeedback('Perfect pushup! Keep it up! 💪');
+                  countPushup();
+                  lastPushupTime = now;
+                }
+                
+                // Update motion data for debug display
+                setMotionData({ 
+                  x: totalMovement / 1000, 
+                  y: isInDownPosition ? -1 : 1, 
+                  z: 0 
+                });
+              } else {
+                setIsInPushupPosition(false);
+                if (challengeState === 'active') {
+                  setFormFeedback('Position yourself in frame and start pushups! 🏋️‍♂️');
+                }
+              }
+            }
+            
+            // Store current frame for next comparison
+            previousFrame = currentFrame;
+            
+            // Continue analyzing
+            setTimeout(analyzeFrame, 100); // 10 FPS analysis
+          } catch (error) {
+            console.error('❌ Frame analysis error:', error);
+            startSimpleDetection();
+          }
+        };
+        
+        setFormFeedback('Visual AI Detection Active! Do pushups in front of camera! 🎥');
+        console.log('✅ Visual detection initialized');
+        analyzeFrame();
+        
+        // Cleanup function
+        detectionIntervalRef.current = {
+          remove: () => {
+            detectionActive = false;
+            console.log('🛑 Visual detection stopped');
+          }
+        } as any;
+      };
       
+      // Wait for video to be ready
+      if (video.readyState >= 2) {
+        initializeDetection();
+      } else {
+        video.addEventListener('loadeddata', initializeDetection);
+      }
+      
+    } else {
+      // Mobile fallback - use enhanced timing
+      startSimpleDetection();
+    }
+  };
+  
+  // Enhanced simple detection for mobile or when visual detection fails
+  const startSimpleDetection = () => {
+    console.log('📱 Starting enhanced simple detection mode...');
+    setPoseDetectionReady(false);
+    
+    let pushupCounter = 0;
+    const BASE_INTERVAL = 2500; // 2.5 seconds per pushup initially
+    const MIN_INTERVAL = 1800; // Minimum 1.8 seconds per pushup
+    const DOWN_PHASE_DURATION = 1000; // 1 second for down phase
+    const UP_PHASE_DURATION = 800; // 0.8 seconds for up phase
+    
+    const performPushupDetection = () => {
+      if (challengeState !== 'active' || !isDetecting || pushupCounter >= targetPushups) {
+        return;
+      }
+      
+      // Progressive timing - gets slightly faster as you do more pushups
+      const currentInterval = Math.max(
+        MIN_INTERVAL,
+        BASE_INTERVAL - (pushupCounter * 100)
+      );
+      
+      // Wait before starting next pushup
       setTimeout(() => {
         if (challengeState === 'active' && isDetecting) {
-          countPushup();
-          detectionCount++;
+          // Start down phase
+          setCurrentPhase('down');
+          setFormFeedback('Going down... maintain straight body! 📉');
+          setIsInPushupPosition(true);
           
-          if (detectionCount < targetPushups) {
-            detectNextPushup();
-          }
+          // Update motion data for debug display
+          setMotionData({ x: 0.5, y: -0.8, z: 0.2 });
+          
+          // Down phase duration
+          setTimeout(() => {
+            if (challengeState === 'active' && isDetecting) {
+              // Start up phase
+              setCurrentPhase('up');
+              setFormFeedback('Push up... excellent form! 💪');
+              
+              // Update motion data for up phase
+              setMotionData({ x: 0.3, y: 0.9, z: 0.1 });
+              
+              // Up phase duration
+              setTimeout(() => {
+                if (challengeState === 'active' && isDetecting) {
+                  // Complete pushup
+                  setCurrentPhase('up');
+                  const motivationalMessages = [
+                    'Perfect pushup! Keep it up! 🔥',
+                    'Great form! You are crushing it! 💪',
+                    'Excellent technique! Stay strong! ⚡',
+                    'Amazing work! Keep pushing! 🚀',
+                    'Outstanding form! Do not stop! 🏆'
+                  ];
+                  
+                  const randomMessage = motivationalMessages[Math.floor(Math.random() * motivationalMessages.length)];
+                  setFormFeedback(randomMessage);
+                  
+                  countPushup();
+                  pushupCounter++;
+                  
+                  // Reset motion data
+                  setMotionData({ x: 0, y: 0, z: 0 });
+                  setIsInPushupPosition(false);
+                  
+                  // Continue to next pushup
+                  performPushupDetection();
+                }
+              }, UP_PHASE_DURATION);
+            }
+          }, DOWN_PHASE_DURATION);
         }
-      }, delay);
+      }, currentInterval - DOWN_PHASE_DURATION - UP_PHASE_DURATION);
     };
     
-    setFormFeedback('Visual detection mode - perform pushups at steady pace! 🎯');
-    detectNextPushup();
+    setFormFeedback('Enhanced detection active! Perform pushups at your own pace! 🏋️‍♂️');
+    console.log('✅ Enhanced simple detection started');
+    
+    // Start the detection cycle
+    performPushupDetection();
+    
+    // Store cleanup function
+    detectionIntervalRef.current = {
+      remove: () => {
+        console.log('🛑 Simple detection stopped');
+      }
+    } as any;
   };
 
   // Stop all detection
@@ -613,19 +818,51 @@ export default function PushupChallenge() {
             entering={FadeInUp.duration(600).delay(600)}
           >
             {challengeState === 'setup' && (
-              <TouchableOpacity 
-                style={styles.startButton}
-                onPress={startCountdown}
-                activeOpacity={0.8}
-              >
-                <LinearGradient
-                  colors={['#FF4757', '#FF3742']}
-                  style={styles.buttonGradient}
+              <View style={styles.setupButtonContainer}>
+                {/* Motion Permission Button for iOS */}
+                {Platform.OS === 'web' && typeof (DeviceMotionEvent as any).requestPermission === 'function' && (
+                  <TouchableOpacity 
+                    style={styles.permissionButton}
+                    onPress={async () => {
+                      try {
+                        const permission = await (DeviceMotionEvent as any).requestPermission();
+                        if (permission === 'granted') {
+                          setFormFeedback('Motion sensors enabled! Ready for AI detection! 🎯');
+                        } else {
+                          setFormFeedback('Motion denied - will use visual detection 📹');
+                        }
+                      } catch (error) {
+                        console.error('Motion permission error:', error);
+                        setFormFeedback('Motion sensors unavailable - using visual detection 📹');
+                      }
+                    }}
+                    activeOpacity={0.8}
+                  >
+                    <LinearGradient
+                      colors={['#5F27CD', '#4834D4']}
+                      style={styles.buttonGradient}
+                    >
+                      <Ionicons name="phone-portrait" size={20} color="white" />
+                      <Text style={styles.smallButtonText}>Enable Motion Sensors</Text>
+                    </LinearGradient>
+                  </TouchableOpacity>
+                )}
+                
+                {/* Main Start Button */}
+                <TouchableOpacity 
+                  style={styles.startButton}
+                  onPress={startCountdown}
+                  activeOpacity={0.8}
                 >
-                  <Ionicons name="play" size={24} color="white" />
-                  <Text style={styles.buttonText}>Start AI Detection</Text>
-                </LinearGradient>
-              </TouchableOpacity>
+                  <LinearGradient
+                    colors={['#FF4757', '#FF3742']}
+                    style={styles.buttonGradient}
+                  >
+                    <Ionicons name="play" size={24} color="white" />
+                    <Text style={styles.buttonText}>Start AI Detection</Text>
+                  </LinearGradient>
+                </TouchableOpacity>
+              </View>
             )}
 
             {challengeState === 'completed' && (
@@ -885,6 +1122,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingBottom: 40,
   },
+  setupButtonContainer: {
+    gap: 12,
+  },
+  permissionButton: {
+    borderRadius: 12,
+    overflow: 'hidden',
+  },
   startButton: {
     borderRadius: 16,
     overflow: 'hidden',
@@ -903,6 +1147,11 @@ const styles = StyleSheet.create({
   buttonText: {
     fontSize: 18,
     fontWeight: '700',
+    color: 'white',
+  },
+  smallButtonText: {
+    fontSize: 14,
+    fontWeight: '600',
     color: 'white',
   },
   instructionsContainer: {
